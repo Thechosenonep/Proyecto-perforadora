@@ -1,0 +1,482 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESP32WebServer.h>
+#include <ESPmDNS.h>
+#include <Wire.h>
+#include <SD.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_NeoMatrix.h>
+#include <Adafruit_NeoPixel.h>
+#include "esp_timer.h"
+#include <RTClib.h>  // Incluir la biblioteca para el módulo DS1307
+#include <Ticker.h>
+
+#define BUZZER_PIN 4  // Pin del zumbador
+
+Ticker buzzerTimer;
+volatile int beepCount = 0;
+volatile bool beeping = false;
+
+
+
+#define PIN 5
+#define BUTTON_PIN 25
+#define BUTTON_PIN_INICIO 34
+#define BUTTON_PIN_TOGGLE 35  // Botón enclavado de on/off
+#define MATRIX_WIDTH 32       // ancho de cada matriz individual
+#define MATRIX_HEIGHT 8       // altura de cada matriz individual
+#define NUM_MATRICES_X 2      // número de matrices horizontalmente
+#define NUM_MATRICES_Y 2      // número de matrices verticalmente
+
+Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(MATRIX_WIDTH, MATRIX_HEIGHT, NUM_MATRICES_X, NUM_MATRICES_Y, PIN,
+                                               NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG + NEO_TILE_TOP + NEO_TILE_LEFT + NEO_TILE_ROWS + NEO_TILE_PROGRESSIVE,
+                                               NEO_GRB + NEO_KHZ800);
+
+const uint16_t colors[] = {
+  matrix.Color(255, 0, 0),    // Rojo
+  matrix.Color(0, 255, 0),    // Verde
+  matrix.Color(0, 0, 255),    // Azul
+  matrix.Color(255, 255, 0),  // Amarillo
+  matrix.Color(255, 0, 255)   // Magenta
+};
+const int numColors = sizeof(colors) / sizeof(colors[0]);
+int currentColorIndex = 0;
+uint16_t currentColor = colors[currentColorIndex];
+
+volatile bool buttonPressed = false;
+volatile int64_t lastDebounceTime = 0;
+int64_t debounceDelay = 1000000;
+volatile boolean starttimer = false;
+volatile bool timerMode = true;
+volatile bool btn1 = false;
+volatile bool btn2 = false;
+volatile bool timerM = false;
+volatile bool countingUp = false;  // Nueva variable para determinar la dirección del conteo
+
+int value = 1;
+const char* ssid = "ESP32-Access-Point";
+const char* password = "12345678";
+ESP32WebServer server(80);
+const int SD_pin = 16;
+RTC_DS1307 rtc;
+bool wifiEnabled = false;
+bool serverStarted = false;
+bool loggingData = false;
+String baseFileName = "/DATALOG_";
+String currentLogFileName;
+DateTime firstLogTime;
+bool isLoggedIn = false;
+String generateFileListHTML(String filter = "");
+bool firsttime = false;
+DateTime startTime;
+DateTime lastTime;
+#define LOGO_WIDTH 8
+#define LOGO_HEIGHT 8
+// Arreglo de bytes del logo personalizado
+static const uint8_t PROGMEM logo_bmp[] = {
+  0xff, 0xff, 0x8b, 0xc9, 0xe3, 0xcb, 0x99, 0xff
+};
+
+void displayStartMessage() {
+  currentColorIndex = 0;  // Reinicia el índice del color al primer color
+  currentColor = colors[currentColorIndex];
+  matrix.fillScreen(0);
+  matrix.setTextSize(2);  // Tamaño de texto más grande posible
+  int16_t x1, y1;
+  uint16_t w, h;
+  matrix.getTextBounds("Listo", 0, 0, &x1, &y1, &w, &h);  // Cambia "Start" por "Inicio"
+  int16_t x = (matrix.width() - w) / 2;
+  int16_t y = (matrix.height() - h) / 2;
+  matrix.setCursor(x, y);
+  matrix.setTextColor(matrix.Color(255, 255, 255));  // Color blanco
+  matrix.print(F("Listo"));  // Cambia "Start" por "Inicio"
+  matrix.show();
+}
+
+
+void displayLogo() {
+  matrix.fillScreen(0);
+  matrix.drawBitmap(0, 0, logo_bmp, LOGO_WIDTH, LOGO_HEIGHT, matrix.Color(255, 0, 0));  // Rojo
+  matrix.show();
+}
+
+void displayTime(int timeInSeconds) {
+  matrix.fillScreen(0);  // Limpia la matriz
+  int minutes = timeInSeconds / 60;
+  int seconds = timeInSeconds % 60;
+  char buf[10];  // Formato del texto
+  sprintf(buf, "%02d:%02d", minutes, seconds);
+
+  matrix.setTextSize(2);  // Tamaño del texto
+
+  // Calcular el centro de la matriz
+  int centerX = (MATRIX_WIDTH * NUM_MATRICES_X - strlen(buf) * 12) / 2;  // 12 es aproximadamente 6 pixels por caracter * tamaño de texto 2
+  int centerY = (MATRIX_HEIGHT * NUM_MATRICES_Y - 16) / 2;  // 16 es aproximadamente 8 pixels de alto por caracter * tamaño de texto 2
+
+  // Efecto de negritas, dibujando el texto con un único desplazamiento hacia abajo y a la derecha
+  for (int offset = 1; offset >= 0; offset--) {
+    matrix.setTextColor(currentColor);  // Color actual
+    matrix.setCursor(centerX + offset, centerY);  // Desplazamiento horizontal sutil
+    matrix.print(buf);
+    matrix.setCursor(centerX, centerY + offset);  // Desplazamiento vertical sutil
+    matrix.print(buf);
+  }
+
+  matrix.setCursor(centerX, centerY);
+  matrix.print(buf);  // Texto principal
+
+  matrix.show();  // Actualiza la matriz para mostrar el texto
+}
+
+
+
+void IRAM_ATTR handleModeToggle() {  //wifi
+  int64_t now = esp_timer_get_time();
+  if ((now - lastDebounceTime) > debounceDelay) {
+    timerMode = !timerMode;
+    timerM = true;
+    lastDebounceTime = now;
+  }
+}
+
+void IRAM_ATTR handleButtonPress()  //botón 1
+{
+  int64_t now = esp_timer_get_time();
+  if ((now - lastDebounceTime) > debounceDelay) {
+    if (timerMode == true) {
+      btn1 = true;
+      starttimer = true;
+    }
+    buttonPressed = !buttonPressed;
+    currentColorIndex = (currentColorIndex + 1) % numColors;  // Avanzar al siguiente color y repetir
+    currentColor = colors[currentColorIndex];
+    matrix.setTextColor(currentColor);
+    lastDebounceTime = now;
+  }
+}
+
+void IRAM_ATTR handleButtonPress2() {
+  int64_t now = esp_timer_get_time();
+  if ((now - lastDebounceTime) > debounceDelay) {
+    if (timerMode == true) {
+      btn2 = true;
+    }
+    starttimer = false;
+    matrix.setTextColor(currentColor);
+    lastDebounceTime = now;
+    if (starttimer == true) {
+      // Reiniciar el temporizador
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+   pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_INICIO, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_TOGGLE, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN_INICIO), handleButtonPress2, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN_TOGGLE), handleModeToggle, CHANGE);
+
+
+  if (!SD.begin(SD_pin)) {
+    Serial.println("Fallo al iniciar SD");
+  }
+
+  if (!rtc.begin()) {
+    Serial.println("No se pudo encontrar el RTC");
+  }
+
+  if (!rtc.isrunning()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+
+  startTime = rtc.now();
+  lastTime = startTime;
+
+  matrix.begin();
+  matrix.setTextWrap(false);
+  matrix.setBrightness(40);
+  matrix.setTextColor(currentColor);
+  displayLogo();  // Muestra el logo al iniciar
+  delay(2000);    // Espera 2 segundos con el logo mostrado
+}
+
+void loop() {
+  if (serverStarted) {
+    server.handleClient();
+  }
+  if (starttimer == true && timerMode == true) {
+    DateTime now = rtc.now();
+    if (now.secondstime() - lastTime.secondstime() >= 1) {  // Actualizar cada segundo
+      lastTime = now;
+      TimeSpan elapsed = now - startTime;
+      int elapsedSeconds = elapsed.totalseconds();
+     int remainingTime = 60 - elapsedSeconds;  // 60 segundos = 1 minuto para probar  // 1500 segundos = 25 minutos
+
+      if (remainingTime > 0) {
+        displayTime(remainingTime);
+      } else {
+        if (!countingUp) {  // Solo iniciamos el sonido una vez
+          startBeepSeries();
+          countingUp = true;  // Evita múltiples llamadas a startBeepSeries
+        }                    // Activar el conteo ascendente
+        displayTime(1500 + (-remainingTime));  // Comenzar el cronómetro desde 25 minutos (1500 segundos)
+        
+      }
+    }
+  }
+  if (btn1 == true && !wifiEnabled) {
+    if (!loggingData) {
+      loggingData = true;
+      firstLogTime = rtc.now();
+      currentLogFileName = baseFileName + firstLogTime.timestamp(DateTime::TIMESTAMP_DATE) + "_" + firstLogTime.timestamp(DateTime::TIMESTAMP_TIME) + ".txt";
+      currentLogFileName.replace(':', '-');
+      Serial.println("Registro de datos iniciado: " + currentLogFileName);
+      // Registro inmediato del dato al iniciar la sesión de registro
+      logData(firstLogTime);
+      btn1 = false;
+    } else {
+      logData(rtc.now());
+      btn1 = false;
+    }
+    delay(200);
+  }
+
+  if (btn2 == true && loggingData) {
+    logData(rtc.now());
+    loggingData = false;
+    closeLogFile();
+    delay(200);
+    btn2 = false;
+  }
+
+  if (starttimer == false && timerMode == true) {
+    displayStartMessage();
+    if (firsttime == true) {
+      btn3();
+    }
+    while (starttimer == false && timerMode == true) {
+      btn2 = false;
+      /* code */
+    }
+    startTime = rtc.now();
+    lastTime = startTime;
+    countingUp = false;  // Reiniciar el conteo ascendente al iniciar el temporizador
+  }
+
+  if (timerMode == false) {
+    // Si estamos cambiando al modo WIFI, muestra el mensaje inmediatamente
+    if (loggingData) {
+    logData(rtc.now());
+    loggingData = false;
+    closeLogFile();
+    starttimer = false;
+    
+  }
+    if (timerM == true) {
+      firsttime = true;
+      btn3();
+      matrix.fillScreen(0);
+      matrix.setTextSize(2);  // Tamaño de texto más grande posible
+      int16_t x1, y1;
+      uint16_t w, h;
+      matrix.getTextBounds("WIFI", 0, 0, &x1, &y1, &w, &h);
+      int16_t x = (matrix.width() - w) / 2;
+      int16_t y = (matrix.height() - h) / 2;
+      matrix.setCursor(x, y);
+      matrix.setTextColor(matrix.Color(0, 255, 255));  // Azul turquesa
+      matrix.print(F("WIFI"));
+      matrix.show();
+      timerM = false;
+    }
+  }
+}
+
+void toggleWiFiMode() {
+  // Agregar esta condición
+    if (wifiEnabled) {
+      WiFi.softAPdisconnect(true);
+      server.stop();
+      MDNS.end();
+      wifiEnabled = false;
+      serverStarted = false;
+      Serial.println("Modo DataLog activado, WiFi apagado");
+    }  
+                                                                                                                                                                                                                                                                                                                                                                                                        if (timerMode == false)  {
+      WiFi.softAP(ssid, password);
+      setupServer();
+      wifiEnabled = true;
+      serverStarted = true;
+      Serial.println("Modo WiFi activado, servidor corriendo");
+    }
+  
+}
+
+
+void setupServer() {
+  server.on("/", HTTP_GET, []() {
+    if (!isLoggedIn) {
+      server.send(200, "text/html", loginPage());
+    } else {
+      handleRoot();
+    }
+  });
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/download", HTTP_GET, handleFileDownload);
+  server.on("/filter", HTTP_POST, handleFilter);
+  server.begin();
+  MDNS.begin("esp32-server");
+  Serial.println("Servidor web iniciado");
+}
+
+
+void handleFileDownload() {
+  String filename = "/" + server.arg("file");  // Asegurarse de que la ruta es correcta
+  if (!filename.isEmpty()) {
+    File file = SD.open(filename, FILE_READ);
+    if (file) {
+      server.streamFile(file, "application/octet-stream");
+      file.close();
+    } else {
+      server.send(404, "text/plain", "Archivo no encontrado");
+    }
+  } else {
+    server.send(400, "text/plain", "Nombre de archivo no especificado");
+  }
+}
+
+
+String generateFileListHTML(String filter) {
+  String html = "<html><head><title>ESP32 File Server</title><meta charset='UTF-8'><style>";
+  html += "body { font-family: Arial, sans-serif; background-color: #f4f4f8; }";
+  html += "h1 { color: #0056b3; text-align: center; }";
+  html += "form { background-color: #e1e5ee; padding: 20px; border-radius: 8px; margin: 20px auto; width: 90%; max-width: 400px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }";
+  html += "input[type='number'], button { width: 100%; padding: 10px; margin-top: 10px; border-radius: 5px; border: 1px solid #ccc; }";
+  html += "button { background-color: #007bff; color: white; font-size: 16px; cursor: pointer; }";
+  html += "button:hover { background-color: #0056b3; }";
+  html += "ul { list-style-type: none; padding: 0; }";
+  html += "li { padding: 8px; margin-bottom: 2px; background-color: #f8f8f8; border: 1px solid #ddd; }";
+  html += "</style></head><body>";
+  html += "<h1>Web server cambio de herramental </h1>";
+  html += "<form action='/filter' method='post'>";
+  html += "Día: <input type='number' name='day' min='1' max='31'><br>";
+  html += "Mes: <input type='number' name='month' min='1' max='12'><br>";
+  html += "Año: <input type='number' name='year' min='2020' max='2030'><br>";
+  html += "<button type='submit'>Filtrar</button>";
+  html += "</form><ul>";
+
+  File root = SD.open("/");
+  while (File file = root.openNextFile()) {
+    if (!file.isDirectory()) {
+      String fileName = String(file.name());
+      if (filter.isEmpty() || fileName.indexOf(filter) != -1) {
+        html += "<li><a href='/download?file=" + fileName + "'>" + fileName + "</a></li>";
+      }
+    }
+    file.close();
+  }
+  root.close();
+
+  html += "</ul></body></html>";
+  return html;
+}
+
+
+String loginPage() {
+  String html = "<html><head><title>Login</title><meta charset='UTF-8'><style>";
+  html += "body { font-family: Arial, sans-serif; background-color: #f4f4f8; }";
+  html += "h1 { color: #0056b3; text-align: center; }";
+  html += "form { background-color: #e1e5ee; padding: 20px; border-radius: 8px; margin: 20px auto; width: 90%; max-width: 300px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }";
+  html += "input, button { width: 100%; padding: 10px; margin-top: 10px; border-radius: 5px; border: 1px solid #ccc; }";
+  html += "button { background-color: #007bff; color: white; font-size: 16px; cursor: pointer; }";
+  html += "button:hover { background-color: #0056b3; }";
+  html += "</style></head><body>";
+  html += "<h1>Login Required</h1>";
+  html += "<form action='/login' method='post'>";
+  html += "Username: <input type='text' name='username'><br>";
+  html += "Password: <input type='password' name='password'><br>";
+  html += "<button type='submit'>Login</button>";
+  html += "</form></body></html>";
+  return html;
+}
+
+void handleLogin() {
+  if (server.arg("username") == "admin" && server.arg("password") == "admin") {
+    isLoggedIn = true;
+    // Enviar cabecera de redirección inmediatamente después de verificar las credenciales
+    server.sendHeader("Location", "/", true);
+    server.send(303);  // Solo envía el código de estado con la cabecera de redirección
+  } else {
+    server.send(401, "text/html", loginPage() + "<p>Login failed! Try again.</p>");
+  }
+}
+
+void btn3() {
+  toggleWiFiMode();
+  delay(200);
+}
+
+void handleRoot() {
+  server.send(200, "text/html", generateFileListHTML());
+}
+void handleFilter() {
+  int day = server.arg("day").toInt();
+  int month = server.arg("month").toInt();
+  int year = server.arg("year").toInt();
+  String filter = String(year) + "-" + (month < 10 ? "0" + String(month) : String(month)) + "-" + (day < 10 ? "0" + String(day) : String(day));
+  server.send(200, "text/html", generateFileListHTML(filter));
+}
+
+void logData(const DateTime& now) {
+  File dataFile = SD.open(currentLogFileName, FILE_APPEND);
+  if (dataFile) {
+    dataFile.println(now.timestamp(DateTime::TIMESTAMP_FULL));
+    dataFile.close();
+    Serial.println("Data logged at: " + now.timestamp(DateTime::TIMESTAMP_FULL));
+  } else {
+    Serial.println("Error opening data file for write");
+  }
+}
+
+void closeLogFile() {
+  Serial.println("Closing log file: " + currentLogFileName);
+}
+
+void startBuzzer() {
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void stopBuzzer() {
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void handleBeep() {
+  if (beepCount < 6) {  // Aumentamos a 6 porque cada 'beep' y 'silencio' cuenta como una acción
+    if (beeping) {
+      stopBuzzer();
+    } else {
+      startBuzzer();
+      beepCount++;
+    }
+    beeping = !beeping;
+  } else {
+    buzzerTimer.detach();  // Detenemos el Timer
+    stopBuzzer();          // Aseguramos que el buzzer está apagado
+    beepCount = 0;         // Resetear el contador para futuras llamadas
+    beeping = false;       // Resetear el estado de 'beeping'
+  }
+}
+
+void startBeepSeries() {
+  if (!beeping && beepCount == 0) {  // Añadimos una comprobación para `beepCount`
+    beepCount = 0;
+    beeping = true;                  // Configuramos beeping a true para evitar reinicios
+    buzzerTimer.attach(0.25, handleBeep); // Inicia el timer con intervalo más corto
+  }
+}
